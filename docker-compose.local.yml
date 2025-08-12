@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  freqtrade:
+    image: freqtradeorg/freqtrade:stable
+    restart: unless-stopped
+    container_name: freqtrade
+    volumes:
+      - "./user_data:/freqtrade/user_data"
+      - "./config_examples:/freqtrade/config_examples:ro"
+    ports:
+      - "8080:8080"
+    # Default command - run webserver (can be overridden)
+    command: >
+      webserver
+      --config /freqtrade/user_data/config.json
+    environment:
+      - FREQTRADE_VERBOSITY=2
