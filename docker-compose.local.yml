@@ -12,7 +12,7 @@ services:
       - "8080:8080"
     # Default command - run webserver (can be overridden)
     command: >
-      webserver
+      trade
       --config /freqtrade/user_data/config.json
     environment:
       - FREQTRADE_VERBOSITY=2

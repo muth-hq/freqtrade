@@ -29,8 +29,12 @@ class MonitoringStrategy(IStrategy):
         "MATIC/USDT"
     ]
     
-    # Webhook configuration
-    WEBHOOK_URL = "http://localhost:3001/api/freqtrade-signals"
+    # Webhook configuration - Updated for Trading Pipeline API
+    WEBHOOK_URL = "http://172.20.0.1:8000/trpc/tradingPipeline.receiveFreqtradeSignal"
+    
+    # Test flag - set to True to generate test signals for API integration testing  
+    # Set to False for real market indicator analysis
+    TEST_MODE = True
     
     # Strategy parameters
     timeframe = '5m'
@@ -54,7 +58,95 @@ class MonitoringStrategy(IStrategy):
         super().__init__(config)
         # Store last signal timestamps to avoid spam
         self.last_signals = {}
+        # Track portfolio-wide signals to avoid spam
+        self.last_portfolio_signal = None
     
+    def _extract_coin_symbol(self, pair: str) -> str:
+        """Extract coin symbol from trading pair (e.g., BTC/USDT -> BTC)"""
+        return pair.split('/')[0]
+    
+    def _get_portfolio_coins_list(self) -> list:
+        """Get list of coin symbols for portfolio"""
+        return [self._extract_coin_symbol(pair) for pair in self.PORTFOLIO_COINS]
+    
+    def _determine_macd_status(self, current: dict, previous: dict) -> str:
+        """Determine MACD status based on current and previous values"""
+        if pd.isna(current.get('macd')) or pd.isna(current.get('macdsignal')):
+            return 'neutral'
+        
+        if pd.isna(previous.get('macd')) or pd.isna(previous.get('macdsignal')):
+            return 'neutral'
+            
+        curr_macd = current['macd']
+        curr_signal = current['macdsignal']
+        prev_macd = previous['macd']
+        prev_signal = previous['macdsignal']
+        
+        # Bullish crossover: MACD crosses above signal
+        if prev_macd <= prev_signal and curr_macd > curr_signal:
+            return 'bullish_crossover'
+        # Bearish crossover: MACD crosses below signal  
+        elif prev_macd >= prev_signal and curr_macd < curr_signal:
+            return 'bearish_crossover'
+        # Bearish divergence: MACD below signal line
+        elif curr_macd < curr_signal:
+            return 'bearish_divergence'
+        else:
+            return 'neutral'
+    
+    def _determine_bb_position(self, current: dict) -> str:
+        """Determine Bollinger Band position"""
+        if pd.isna(current.get('close')) or pd.isna(current.get('bb_upper')) or pd.isna(current.get('bb_lower')):
+            return 'middle_band'
+            
+        price = current['close']
+        bb_upper = current['bb_upper']
+        bb_lower = current['bb_lower']
+        bb_middle = current.get('bb_middle', (bb_upper + bb_lower) / 2)
+        
+        # Check for bounces off bands
+        if price <= bb_lower * 1.001:  # Small tolerance for "at" the band
+            return 'lower_band_bounce'
+        elif price >= bb_upper * 0.999:  # Small tolerance for "at" the band
+            return 'upper_band_bounce'
+        # Check position relative to bands
+        elif price > bb_upper:
+            return 'upper_band'
+        elif price < bb_lower:
+            return 'lower_band'
+        else:
+            return 'middle_band'
+    
+    def _calculate_signal_strength(self, current: dict, signals: list) -> float:
+        """Calculate overall signal strength from 0-1 based on indicators"""
+        strength_score = 0.5  # Default neutral
+        
+        # RSI contribution
+        if not pd.isna(current.get('rsi')):
+            rsi = current['rsi']
+            if rsi < 30:
+                strength_score += 0.2  # Oversold = potential buy
+            elif rsi > 70:
+                strength_score += 0.1  # Overbought = potential sell signal
+        
+        # MACD contribution  
+        macd_status = self._determine_macd_status(current, {})
+        if 'bullish' in macd_status:
+            strength_score += 0.15
+        elif 'bearish' in macd_status:
+            strength_score += 0.1
+            
+        # Volume contribution
+        if not pd.isna(current.get('volume')) and not pd.isna(current.get('volume_sma')):
+            if current['volume'] > current['volume_sma'] * 1.5:
+                strength_score += 0.1
+        
+        # Number of signals contribution
+        if len(signals) > 2:
+            strength_score += 0.05
+            
+        return min(1.0, max(0.0, strength_score))
+
     def informative_pairs(self):
         """
         Define additional, informative pair/interval combinations to be cached from the exchange.
@@ -139,11 +231,20 @@ class MonitoringStrategy(IStrategy):
     
     def _check_and_send_signals(self, dataframe: DataFrame, pair: str):
         """
-        Check for various technical analysis signals and send webhooks
+        Check for various technical analysis signals and send portfolio-wide webhook
         """
         if len(dataframe) < 50:  # Need more data for proper indicator calculation
             logger.debug(f"Not enough data for {pair}: {len(dataframe)} rows")
             return
+        
+        # Only process signals for the primary coin and send portfolio-wide snapshot
+        # Rate limiting: only send portfolio signal once every 5 minutes
+        current_time = datetime.now()
+        if self.last_portfolio_signal:
+            time_diff = (current_time - self.last_portfolio_signal).total_seconds()
+            if time_diff < 300:  # 5 minutes
+                logger.debug(f"Portfolio signal rate limited - last sent {time_diff:.1f}s ago")
+                return
         
         try:
             current = dataframe.iloc[-1]
@@ -152,180 +253,85 @@ class MonitoringStrategy(IStrategy):
             # Log current indicator values for debugging
             logger.debug(f"[{pair}] RSI: {current.get('rsi', 'N/A')}, MACD: {current.get('macd', 'N/A')}, ADX: {current.get('adx', 'N/A')}")
             
-            signals = []
+            # Extract coin symbol for portfolio snapshot
+            coin = self._extract_coin_symbol(pair)
+            
+            # Build portfolio-wide signal matching our tRPC schema
+            portfolio_signal = {
+                'coin': coin,  # Primary coin that triggered the signal
+                'indicators': {
+                    'rsi': float(current.get('rsi', 50.0)) if not pd.isna(current.get('rsi')) else 50.0,
+                    'macd': self._determine_macd_status(current, previous),
+                    'bb_position': self._determine_bb_position(current),
+                    'sma_20': float(current.get('ma_20', 0.0)) if not pd.isna(current.get('ma_20')) else None,
+                    'sma_50': float(current.get('ma_50', 0.0)) if not pd.isna(current.get('ma_50')) else None,
+                    'ema_12': float(current.get('ema_12', 0.0)) if not pd.isna(current.get('ema_12')) else None,
+                    'ema_26': float(current.get('ema_26', 0.0)) if not pd.isna(current.get('ema_26')) else None,
+                    'volume_24h': float(current.get('volume', 0.0)) if not pd.isna(current.get('volume')) else None,
+                },
+                'portfolio_coins': self._get_portfolio_coins_list(),
+                'timestamp': current_time.isoformat() + 'Z',
+                'signal_strength': self._calculate_signal_strength(current, []),
+                'pair': pair,
+                'timeframe': self.timeframe
+            }
+            
+            # Send portfolio-wide snapshot
+            self._send_portfolio_webhook(portfolio_signal)
+            
         except Exception as e:
-            logger.error(f"Error accessing dataframe data for {pair}: {str(e)}")
-            return
-        
-        # RSI Signals - check for valid RSI values
-        if not pd.isna(current['rsi']):
-            if current['rsi'] < 30:
-                signals.append({
-                    'type': 'rsi_oversold',
-                    'message': f'{pair} RSI oversold: {current["rsi"]:.2f}',
-                    'value': float(current['rsi']),
-                    'strength': 'high' if current['rsi'] < 25 else 'medium'
-                })
-            elif current['rsi'] > 70:
-                signals.append({
-                    'type': 'rsi_overbought', 
-                    'message': f'{pair} RSI overbought: {current["rsi"]:.2f}',
-                    'value': float(current['rsi']),
-                    'strength': 'high' if current['rsi'] > 75 else 'medium'
-                })
-        
-        # Golden Cross / Death Cross - check for valid MA values
-        if (not pd.isna(current['ma_20']) and not pd.isna(current['ma_50']) and 
-            not pd.isna(previous['ma_20']) and not pd.isna(previous['ma_50'])):
-            if previous['ma_20'] <= previous['ma_50'] and current['ma_20'] > current['ma_50']:
-                signals.append({
-                    'type': 'golden_cross',
-                    'message': f'{pair} Golden Cross: MA20 crossed above MA50',
-                    'value': {'ma_20': float(current['ma_20']), 'ma_50': float(current['ma_50'])},
-                    'strength': 'high'
-                })
-            elif previous['ma_20'] >= previous['ma_50'] and current['ma_20'] < current['ma_50']:
-                signals.append({
-                    'type': 'death_cross',
-                    'message': f'{pair} Death Cross: MA20 crossed below MA50',
-                    'value': {'ma_20': float(current['ma_20']), 'ma_50': float(current['ma_50'])},
-                    'strength': 'high'
-                })
-        
-        # MACD Signals - check for valid MACD values
-        if (not pd.isna(current['macd']) and not pd.isna(current['macdsignal']) and 
-            not pd.isna(previous['macd']) and not pd.isna(previous['macdsignal'])):
-            if previous['macd'] <= previous['macdsignal'] and current['macd'] > current['macdsignal']:
-                signals.append({
-                    'type': 'macd_bullish',
-                    'message': f'{pair} MACD bullish crossover',
-                    'value': {'macd': float(current['macd']), 'signal': float(current['macdsignal'])},
-                    'strength': 'medium'
-                })
-            elif previous['macd'] >= previous['macdsignal'] and current['macd'] < current['macdsignal']:
-                signals.append({
-                    'type': 'macd_bearish',
-                    'message': f'{pair} MACD bearish crossover', 
-                    'value': {'macd': float(current['macd']), 'signal': float(current['macdsignal'])},
-                    'strength': 'medium'
-                })
-        
-        # Volume Spike Detection - check for valid volume values
-        if (not pd.isna(current['volume']) and not pd.isna(current['volume_sma']) and 
-            current['volume_sma'] > 0 and current['volume'] > current['volume_sma'] * 2):
-            signals.append({
-                'type': 'volume_spike',
-                'message': f'{pair} Volume spike detected: {current["volume"]:.0f} vs avg {current["volume_sma"]:.0f}',
-                'value': {'volume': float(current['volume']), 'avg_volume': float(current['volume_sma'])},
-                'strength': 'medium'
-            })
-        
-        # Bollinger Band Breakouts - check for valid BB values
-        if (not pd.isna(current['close']) and not pd.isna(current['bb_upper']) and not pd.isna(current['bb_lower'])):
-            if current['close'] > current['bb_upper']:
-                signals.append({
-                    'type': 'bb_upper_breakout',
-                    'message': f'{pair} Price broke above upper Bollinger Band',
-                    'value': {'price': float(current['close']), 'bb_upper': float(current['bb_upper'])},
-                    'strength': 'medium'
-                })
-            elif current['close'] < current['bb_lower']:
-                signals.append({
-                    'type': 'bb_lower_breakout',
-                    'message': f'{pair} Price broke below lower Bollinger Band',
-                    'value': {'price': float(current['close']), 'bb_lower': float(current['bb_lower'])},
-                    'strength': 'medium'
-                })
-        
-        # Stochastic Signals - check for valid stochastic values
-        if (not pd.isna(current['stoch_k']) and not pd.isna(current['stoch_d'])):
-            if current['stoch_k'] < 20 and current['stoch_d'] < 20:
-                signals.append({
-                    'type': 'stochastic_oversold',
-                    'message': f'{pair} Stochastic oversold: K={current["stoch_k"]:.2f}, D={current["stoch_d"]:.2f}',
-                    'value': {'stoch_k': float(current['stoch_k']), 'stoch_d': float(current['stoch_d'])},
-                    'strength': 'medium'
-                })
-            elif current['stoch_k'] > 80 and current['stoch_d'] > 80:
-                signals.append({
-                    'type': 'stochastic_overbought',
-                    'message': f'{pair} Stochastic overbought: K={current["stoch_k"]:.2f}, D={current["stoch_d"]:.2f}',
-                    'value': {'stoch_k': float(current['stoch_k']), 'stoch_d': float(current['stoch_d'])},
-                    'strength': 'medium'
-                })
-        
-        # Williams %R Signals - check for valid Williams %R values
-        if not pd.isna(current['williams_r']):
-            if current['williams_r'] < -80:
-                signals.append({
-                    'type': 'williams_oversold',
-                    'message': f'{pair} Williams %R oversold: {current["williams_r"]:.2f}',
-                    'value': float(current['williams_r']),
-                    'strength': 'low'
-                })
-            elif current['williams_r'] > -20:
-                signals.append({
-                    'type': 'williams_overbought',
-                    'message': f'{pair} Williams %R overbought: {current["williams_r"]:.2f}',
-                    'value': float(current['williams_r']),
-                    'strength': 'low'
-                })
-        
-        # ADX Trend Strength - check for valid ADX values
-        if not pd.isna(current['adx']) and current['adx'] > 25:
-            signals.append({
-                'type': 'strong_trend',
-                'message': f'{pair} Strong trend detected: ADX={current["adx"]:.2f}',
-                'value': float(current['adx']),
-                'strength': 'low'
-            })
-        
-            # Send signals to webhook
-            for signal in signals:
-                self._send_webhook(pair, signal)
-                
-        except Exception as e:
-            logger.error(f"Error processing signals for {pair}: {str(e)}")
+            logger.error(f"Error processing portfolio signal for {pair}: {str(e)}")
             return
     
-    def _send_webhook(self, pair: str, signal: dict):
+    def _send_portfolio_webhook(self, portfolio_signal: dict):
         """
-        Send signal data to webhook endpoint
+        Send portfolio-wide signal data to tRPC API endpoint
         """
-        signal_key = f"{pair}_{signal['type']}"
         current_time = datetime.now()
         
-        # Rate limiting: don't send same signal type for same pair within 5 minutes
-        if signal_key in self.last_signals:
-            time_diff = (current_time - self.last_signals[signal_key]).total_seconds()
-            if time_diff < 300:  # 5 minutes
-                return
-        
-        payload = {
-            'timestamp': current_time.isoformat(),
-            'pair': pair,
-            'signal_type': signal['type'],
-            'message': signal['message'],
-            'value': signal['value'],
-            'strength': signal['strength'],
-            'strategy': 'MonitoringStrategy'
-        }
+        # Print portfolio signal for monitoring
+        logger.info(f">>>>>>>>>>>>>> PORTFOLIO SIGNAL DETECTED: {portfolio_signal['coin']}")
+        print(f">>>>>>>>>>>>>> PORTFOLIO SIGNAL DETECTED: {portfolio_signal['coin']}", flush=True)
+        print(f">>>>>>>>>>>>>>>>   📊 Primary Coin: {portfolio_signal['coin']}", flush=True)
+        print(f">>>>>>>>>>>>>>>>   📈 RSI: {portfolio_signal['indicators']['rsi']:.2f}", flush=True) 
+        print(f">>>>>>>>>>>>>>>>   💪 MACD: {portfolio_signal['indicators']['macd']}", flush=True)
+        print(f">>>>>>>>>>>>>>>>   📋 BB Position: {portfolio_signal['indicators']['bb_position']}", flush=True)
+        print(f">>>>>>>>>>>>>>>>   🎯 Signal Strength: {portfolio_signal['signal_strength']:.2f}", flush=True)
+        print(f">>>>>>>>>>>>>>>>   💼 Portfolio: {', '.join(portfolio_signal['portfolio_coins'])}", flush=True)
+        print(f">>>>>>>>>>>>>>>>   ⏰ Time: {current_time.strftime('%H:%M:%S')}", flush=True)
+        print(">>>>>>>>>>>>>> " + "-" * 50, flush=True)
         
         try:
+            # Send to tRPC API endpoint
             response = requests.post(
                 self.WEBHOOK_URL,
-                json=payload,
-                timeout=5,
+                json=portfolio_signal,  # Send the portfolio signal directly (matches our Zod schema)
+                timeout=10,
                 headers={'Content-Type': 'application/json'}
             )
             
             if response.status_code == 200:
-                logger.info(f"Webhook sent successfully for {pair}: {signal['type']}")
-                self.last_signals[signal_key] = current_time
+                logger.info(f"Portfolio webhook sent successfully for {portfolio_signal['coin']}")
+                print(f"✅ Portfolio webhook sent successfully!", flush=True)
+                self.last_portfolio_signal = current_time
+                
+                # Parse and display response
+                try:
+                    response_data = response.json()
+                    if response_data.get('success'):
+                        execution_id = response_data['data']['execution_id']
+                        print(f"🚀 Trading Pipeline triggered! Execution ID: {execution_id}", flush=True)
+                    else:
+                        print(f"⚠️  API response error: {response_data.get('error', 'Unknown error')}", flush=True)
+                except:
+                    print(f"✅ API responded successfully (couldn't parse response)", flush=True)
             else:
-                logger.warning(f"Webhook failed for {pair}: {response.status_code} - {response.text}")
+                logger.warning(f"Portfolio webhook failed: {response.status_code} - {response.text}")
+                print(f"⚠️  Webhook failed: {response.status_code} - {response.text[:200]}", flush=True)
                 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Webhook request failed for {pair}: {str(e)}")
+            logger.error(f"Portfolio webhook request failed: {str(e)}")
+            print(f"⚠️  Webhook failed (connection error): {str(e)}", flush=True)
         except Exception as e:
-            logger.error(f"Unexpected error sending webhook for {pair}: {str(e)}")
+            logger.error(f"Unexpected error sending portfolio webhook: {str(e)}")
+            print(f"⚠️  Webhook error: {str(e)}", flush=True)
